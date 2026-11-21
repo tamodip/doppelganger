@@ -16,6 +16,9 @@ Python 3 standard library only. No language model, no network, no randomness.
 | Run time | about 8 seconds for the full development set (72k customers) |
 | Cost | $0 (no model calls) |
 | Reproducibility | 5 runs, byte-identical output |
+| Policy rule tests (`tools/test_policy.py`) | 48 of 48 pass, one per rule including the rare ones, plus 10 hardening tests |
+| Independent 168-case adversarial suite (from a second implementation) | 168 of 168 pass, 0 unsafe clearances |
+| Reworded-data stress test (`tools/stress_test.py`) | 819 of 819 decisions unchanged after about 175,000 rewordings; 0 new clearances |
 
 ## Architecture
 
@@ -92,8 +95,34 @@ The hit has no `dobs`, but its profile notes say "when investigators questioned 
 **Left for review: H-FF3096 → REVIEW / INSUFFICIENT_DATA.**
 The customer's name agrees with "Abdul Rahman Yasin", and a support note (NOTE-10AEAB) says they lived in the United States, a country tied to the hit, so location can't clear it. The hit gives no date of birth anywhere (fields, notes or matching search results), so it can be neither cleared nor confirmed. A human decides.
 
+## Tested beyond the 50 practice labels
+The unseen set has new customers, new hits, differently worded free text, and policy situations that are rare in the development set. We test for exactly that.
+
+**1. One test per policy rule** (`python3 tools/test_policy.py`, 48 tests, under 1 second). Each test builds a tiny synthetic data room and runs the real engine end to end. The tests cover the rare cases the brief warns about: a deceased hit, a company incorporated after the earliest report, a person against a company, placeholder names (N/A, XXX), names written together or apart, a single-part alias, an ambiguous customer (same and different decisions), records merged by phone + DOB but not by phone alone, rejected checks and rejected notes ignored, verified beats declared, an unreadable verified DOB never falling back to the declared one, ages as two birth years, "37 million" not being an age, search results needing both the listing phrase and a country, month-first provider dates, the 1-year DOB tolerance, a same-year month mismatch, and a country difference not clearing a name + DOB agreement. We checked that the tests have teeth: deliberately breaking a rule in the engine (ignoring deaths, trusting rejected checks, dropping the 1-year tolerance, letting location clear a name + DOB agreement) makes its test fail.
+
+**2. Reworded-data stress test** (`python3 tools/stress_test.py dev`, about 25 seconds). This builds a perturbed copy of the development set with the same facts written differently, runs the engine on both, and compares. It applies about 175,000 perturbations: 15,694 verification notes rewritten into 6 new sentence templates, 2,033 residence notes rewritten, about 50,000 dates reformatted (ISO, day-first, "10 June 1962", "June 10, 1962", "10 Jun 1962"), about 72,000 countries rewritten as ISO codes, nationality adjectives or capitals, about 34,000 names reordered ("LAST, First"), re-cased or stripped of accents, and 805 age phrases reworded. **Result: 819 of 819 decisions and reason codes unchanged, and 0 new clearances.** (The verification-note templates are filled from facts the engine extracted from the originals, so the test checks robustness to wording and format, not to facts it could not read in the first place.)
+
+**3. Audit-trail viewer** (`python3 tools/build_viewer.py dev output/dev.jsonl viewer.html`). This writes one self-contained page: pick a hit and follow alert → link → customer records (merged where policy says so) → identity checks (rejected ones greyed out) → notes → the listed person → decision, with every cited record highlighted. It embeds event data, so it stays local and is git-ignored.
+
 ## Cross-checked against an independent implementation
 We compared all 819 decisions with a second, independently written rules engine. They disagreed on only 8 hits. We traced each one to the policy text and fixed the 2 where we were wrong (an age wording we missed, and a name + DOB agreement with a country difference, which the policy says is REVIEW). One disagreement was the other engine trusting a self-declared birth date over a verified note, which would have been an unsafe clearance.
+
+**Second round (hardening).** We then ran our engine through the other implementation's 168-case adversarial suite and its paraphrase check, and ran our 38 tests against it. Ours wrongly cleared 10 of those 168 cases. All 10 are now fixed, each with its own test:
+- **Letters that accent-stripping misses:** Turkish ı, German ß, Icelandic þ/ð, Polish ł, Nordic ø/æ are folded to Latin before names are compared (Işık = Isik, Strauß = Strauss).
+- **Look-alike and foreign scripts:** a verified name with a Cyrillic "А" posing as a Latin A is read as Latin. A name still in another script after folding, or a hit known only in another script, can never clear on name.
+- **Approximate hit dates:** "circa 1980", "c. 1980" and "1980s" never contradict. A range like "1979-1981" contradicts only when every year in it is more than a year away.
+- **Ambiguous country names:** a bare "Congo" or "Korea", or "Taiwan, Province of China", is treated as unreadable, so it can't clear on location.
+- **Note dates:**
+  - a birth date with a two-digit year ("12/04/85") is unreadable, so it is not guessed;
+  - in a note that writes dates month-first, an ambiguous slash date keeps only its year;
+  - the check date is never taken as the birth date.
+- **Phone support calls:** "identity verified on the phone by security questions" is not an identity check and no longer overrides the real KYC check.
+- **A hit whose own sources disagree:** if its profile notes give one DOB and its matching search results give another that agrees with the customer, the hit goes to REVIEW, never a clearance. The one development hit this changes (H-2C6B2E) is unlabelled; a wrong clearance there would cost 60.
+- **Placeholder phone numbers** (0000000000, +44 7000000000): records joined only through one are decided both joined and apart. If the two answers differ, the hit goes to REVIEW.
+- **Customer record:** within a person, we now report the record the alert actually reached (via account, login or email, or the one that fits the screened details): active before closed, newest first.
+- **Notes that open with the name** ("Daniel Sargsyan — DOB: ...") and ages in sentences with initials ("Mark E. Phillips, then 24 years of age") are now read.
+
+After the fixes the two engines agree on all 819 development decisions. The practice score is unchanged (50/50, cost 0), and both paraphrase checks change 0 decisions.
 
 ## What we can't do (honest limits)
 - Free text worded very differently from anything above (for example a birth date given only as "born the year the Berlin Wall fell") won't be read. The engine then falls back to REVIEW, never to a clearance.

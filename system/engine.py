@@ -55,9 +55,24 @@ def sval(v):
 
 # ---------------------------------------------------------------- normalising
 
+# letters NFKD cannot take apart, and Cyrillic/Greek letters that look exactly like Latin ones
+_FOLD = str.maketrans({"ı": "i", "İ": "I", "ß": "ss", "ẞ": "SS", "þ": "th", "Þ": "Th", "ð": "d", "Ð": "D", "ø": "o", "Ø": "O",
+                       "æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE", "ł": "l", "Ł": "L", "đ": "d", "Đ": "D", "ħ": "h", "Ħ": "H",
+                       "ŋ": "ng", "ĸ": "k", "ŀ": "l", "ſ": "s",
+                       "А": "A", "а": "a", "В": "B", "Е": "E", "е": "e", "К": "K", "к": "k", "М": "M", "Н": "H", "О": "O",
+                       "о": "o", "Р": "P", "р": "p", "С": "C", "с": "c", "Т": "T", "у": "y", "Х": "X", "х": "x", "І": "I",
+                       "і": "i", "Ј": "J", "ј": "j", "Ѕ": "S", "ѕ": "s", "Α": "A", "Β": "B", "Ε": "E", "Ζ": "Z", "Η": "H",
+                       "Ι": "I", "Κ": "K", "Μ": "M", "Ν": "N", "Ο": "O", "ο": "o", "Ρ": "P", "Τ": "T", "Υ": "Y", "Χ": "X"})
+
+
 def strip_accents(s):
-    s = unicodedata.normalize("NFKD", s)
+    s = unicodedata.normalize("NFKD", s.translate(_FOLD))
     return "".join(c for c in s if not unicodedata.combining(c))
+
+
+def non_latin(s):
+    """True if a name still holds letters from another script after folding (e.g. Cyrillic, Arabic, Chinese)."""
+    return any(c.isalpha() and not ("a" <= c.lower() <= "z") for c in strip_accents(sval(s)))
 
 
 def norm_text(s):
@@ -71,6 +86,7 @@ with open(os.path.join(HERE, "countries.json"), encoding="utf-8") as _f:
     _C = json.load(_f)
 COUNTRY_NAMES = _C["names"]
 COUNTRY_CODES = _C["codes"]
+AMBIGUOUS_COUNTRIES = {"congo", "korea", "the congo", "republic of the congo or drc"}   # two countries share the bare name
 NOT_COUNTRIES = {"international", "europe", "global", "worldwide", "unknown", "n a", "na", "none", ""}
 # free text: multi-word first, skip ambiguous short words
 _FREE_SKIP = {"us", "u s", "in", "chad", "jordan", "georgia", "american", "english", "guinea", "turkey", "niger", "dominican"}
@@ -83,7 +99,7 @@ def country_of(value):
     """Structured field -> canonical country (or None)."""
     v = re.sub(r"\[.*?\]|\(.*?\)", " ", sval(value))
     k = norm_text(v)
-    if k in NOT_COUNTRIES:
+    if k in NOT_COUNTRIES or k in AMBIGUOUS_COUNTRIES or "province of" in k:
         return None
     if k in COUNTRY_NAMES:
         return COUNTRY_NAMES[k]
@@ -384,6 +400,12 @@ def names_agree_any(cust_names, hit_names, company=False):
 # ------------------------------------------------------------------- the data
 
 
+def placeholder_phone(digits):
+    """'0000000000', '+44 7000000000', '123456789': numbers that cannot tie two people together."""
+    tail = digits[-9:]
+    return (len(set(tail)) == 1 or bool(re.search(r"(\d)\1{6,}", digits)) or tail in "0123456789" or tail in "9876543210")
+
+
 class Data:
     def __init__(self, folder):
         j = lambda n: read_jsonl(os.path.join(folder, n))
@@ -454,6 +476,12 @@ class Data:
         return out
 
     def _persons(self):
+        # two groupings: 'full' follows every link the policy names; 'strict' leaves out links made only
+        # through a placeholder phone number. When they differ for an alert, both are decided.
+        self.person_of, self.members = self._cluster(allow_placeholder=True)
+        self.person_of_strict, self.members_strict = self._cluster(allow_placeholder=False)
+
+    def _cluster(self, allow_placeholder):
         parent = {rid: rid for rid in self.customers}
 
         def find(x):
@@ -476,22 +504,23 @@ class Data:
             d = parse_date(c.get("dob"))
             phones = set()
             ph = re.sub(r"\D", "", sval(c.get("phone")))
-            if len(ph) >= 6:
+            if len(ph) >= 6 and (allow_placeholder or not placeholder_phone(ph)):
                 phones.add(ph)
             if d and d.full():
                 for ph in phones:
                     by_phone_dob[(ph, d.key())].append(rid)
             for k in self.approved_checks(rid):
                 dn = re.sub(r"[^A-Z0-9]", "", sval(k.get("document_number")).upper())
-                if len(dn) >= 4:
+                if len(dn) >= 4 and not re.fullmatch(r"(.)\1+|0+|123456789?|X+|NA|NONE|UNKNOWN", dn):
                     by_doc[dn].append(rid)
         for grp in list(by_phone_dob.values()) + list(by_doc.values()):
             for r in grp[1:]:
                 union(grp[0], r)
-        self.person_of = {rid: find(rid) for rid in self.customers}
-        self.members = defaultdict(list)
+        person_of = {rid: find(rid) for rid in self.customers}
+        members = defaultdict(list)
         for rid in sorted(self.customers):
-            self.members[self.person_of[rid]].append(rid)
+            members[person_of[rid]].append(rid)
+        return person_of, members
 
     def person_records(self, rid):
         return self.members[self.person_of[rid]]
@@ -562,20 +591,36 @@ class Data:
             how = "email %s" % email
         linked = [r for r in linked if r in self.customers]
         if linked:
-            persons = self._group(linked)
-            if len(persons) > 1:
-                fit = [p for p in persons if any(self.fits_screened(r, alert) for r in p)]
-                if fit:
-                    persons = fit
-            return persons, how
-        found = self.search_customers(alert)
-        return self._group(found), "screened details search"
+            anchors = linked
+            if len(self._group(linked)) > 1:
+                fit = [r for r in linked if self.fits_screened(r, alert)]
+                anchors = fit or linked
+        else:
+            anchors = self.search_customers(alert)
+            how = "screened details search"
+        self.last_anchors = anchors
+        return self._group(anchors), how
 
-    def _group(self, rids):
+    def _group(self, rids, strict=False):
+        """People reached by these records; within a person, the records actually reached come first
+        (active before closed, newest first), then the person's other records."""
+        po, mem = (self.person_of_strict, self.members_strict) if strict else (self.person_of, self.members)
         seen = {}
         for r in rids:
-            seen.setdefault(self.person_of[r], None)
-        return [self.members[p] for p in sorted(seen)]
+            seen.setdefault(po[r], []).append(r)
+        out = []
+        for p in sorted(seen):
+            def rank(r):
+                c = self.customers[r]
+                st = norm_text(c.get("status"))
+                return (0 if st == "active" else 1 if st in ("dormant", "") else 2,
+                        tuple(-x for x in (parse_date(c.get("onboarded_at")) or D(1850)).key()), r)
+            first = sorted(set(seen[p]), key=rank)
+            out.append(first + [r for r in mem[p] if r not in first])
+        return out
+
+    def strict_persons(self):
+        return self._group(self.last_anchors, strict=True)
 
 # ------------------------------------------------------------ customer picture
 
@@ -628,8 +673,14 @@ def _upper_name(text):
         best = cur
     if best:
         return " ".join(best)
-    m = re.search(r"(?:for|of|named|customer|applicant|subject|holder as)\s+([A-Z][a-z'\-]+(?:\s+[A-Z][a-z'\-]+){1,3})", text)
-    return m.group(1) if m else None
+    m = re.search(r"(?:for|of|named|customer|applicant|subject|holder as|name:?)\s+([A-Z][a-z'\-]+(?:\s+[A-Z][a-z'\-]+){1,3})", text)
+    if m:
+        return m.group(1)
+    # a note that opens with the person's name: "Daniel Sargsyan — DOB: ...", "Daniel Sargsyan's passport ..."
+    m = re.match(r"\s*([A-Z][a-z'\-]+(?:\s+[A-Z][a-z'\-]+){1,3})(?:'s\b|’s\b|\s*(?:—|–|-|,|:|\(|\|))", text)
+    if m and not re.match(r"(?:On|In|At|The|Customer|Passport|Identity|Document|Today|Verified|Approved)\b", m.group(1)):
+        return m.group(1)
+    return None
 
 
 BIRTH_KW = re.compile(r"\b(born|birth|dob|d\.o\.b|date of birth|birthday)\b", re.I)
@@ -640,12 +691,29 @@ def note_dob(text, created):
     1) a date shortly after a birth keyword; 2) otherwise the one date that is
     clearly in the past (>= 10 years before the note) and is not the check date."""
     ds = [x for x in dates_in_text(text) if not (len(str(x[2])) == 4 and re.search(r"[A-Z]\d*" + str(x[2].y), text))]
+    # a slash date whose second number is over 12 shows the note writes month-first
+    month_first = any(int(b) > 12 >= int(a) for a, b in re.findall(r"\b(\d{1,2})/(\d{1,2})/\d{4}\b", text))
+    if month_first:
+        fixed = []
+        for st, en, d in ds:
+            raw = text[st:en]
+            mm = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", raw)
+            if mm and int(mm.group(1)) <= 12 and int(mm.group(2)) <= 12 and mm.group(1) != mm.group(2):
+                d = D(d.y)                 # day and month cannot be told apart: keep only the year
+            elif mm and int(mm.group(2)) > 12:
+                d = _ok(int(mm.group(3)), int(mm.group(1)), int(mm.group(2))) or d
+            fixed.append((st, en, d))
+        ds = fixed
     for kw in BIRTH_KW.finditer(text):
+        # a birth date written with a two-digit year cannot be read safely
+        if re.match(r"[:\s]*(?:on\s+)?\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2}\b(?![/.\-]?\d)", text[kw.end():kw.end() + 20]):
+            return None
         after = [x for x in ds if 0 <= x[0] - kw.end() <= 45]
         if after:
             after.sort(key=lambda x: x[0])
             return after[0][2]
-        before = [x for x in ds if 0 <= kw.start() - x[1] <= 6]
+        before = [x for x in ds if 0 <= kw.start() - x[1] <= 6 and not (created and x[2] == created)
+                  and (created is None or x[2].y <= created.y - 10)]
         if before:
             return before[-1][2]
     old = [x[2] for x in ds if not (created and x[2] == created) and (created is None or x[2].y <= created.y - 10)]
@@ -664,6 +732,11 @@ def note_check(n):
         return None
     if NOTE_BAD.search(text):
         return {"ok": False}             # rejected / failed / expired: not evidence
+    if not re.search(r"\b(passport|national id|id card|identity card|driving licen[cs]e|driver'?s licen[cs]e|document|residence permit|"
+                     r"kyc|onfido|sumsub|persona|jumio|veriff|trulioo|idnow|yoti|mitek|socure|selfie|liveness|biometric)\b", text, re.I) and \
+            re.search(r"security questions?|on the phone|by phone|over the phone|phone call|passcode|password|one[- ]time|\botp\b|"
+                      r"memorable (?:word|information)|called (?:in|about)", text, re.I):
+        return None                      # a support-call security check is not an identity check
     name = _upper_name(text)
     dob = note_dob(text, parse_date(n.get("created_at")))
     # document country: country mentioned in the text
@@ -787,15 +860,41 @@ AGE_RE = re.compile(
 
 
 class HitDob:
-    def __init__(self, years, m=None, d=None, src=None, how=""):
+    def __init__(self, years, m=None, d=None, src=None, how="", approx=False):
         self.years = set(years)
-        self.m, self.d, self.src, self.how = m, d, src, how
+        self.m, self.d, self.src, self.how, self.approx = m, d, src, how, approx
 
     def __str__(self):
         ys = sorted(self.years)
         if len(ys) == 1:
             return str(D(ys[0], self.m, self.d))
         return " or ".join(str(y) for y in ys)
+
+
+_APPROX = re.compile(r"\b(?:c\.|ca\.|circa|about|approx(?:\.|imately)?|around|est(?:\.|imated)?|roughly|abt\.?)\s*", re.I)
+
+
+def parse_hit_dob(v, src=None, how="listed"):
+    """A provider's date of birth: an exact or partial date, a year range ('1979-1981'), a decade ('1980s')
+    or an approximate year ('circa 1980'). Approximate values never contradict."""
+    t = sval(v).strip()
+    if not t:
+        return None
+    approx = bool(_APPROX.search(t))
+    t2 = _APPROX.sub("", t).strip()
+    m = re.fullmatch(r"(\d{4})\s*(?:-|–|—|to|/)\s*(\d{4})", t2)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        if 1850 <= a <= b <= 2100 and b - a <= 15:
+            return HitDob(range(a, b + 1), None, None, src, how, approx)
+    m = re.fullmatch(r"(?:the\s+)?(\d{3})0'?s", t2, re.I)
+    if m:
+        y0 = int(m.group(1)) * 10
+        return HitDob(range(y0, y0 + 10), None, None, src, how, True)
+    d = parse_date(t2)
+    if d:
+        return HitDob({d.y}, d.m, d.d, src, how, approx)
+    return None
 
 
 class Hit:
@@ -849,9 +948,9 @@ class Hit:
         self.dobs = []
         self.dob_source = None
         for v in as_list(h.get("dobs")):
-            d = parse_date(v)
-            if d:
-                self.dobs.append(HitDob({d.y}, d.m, d.d, None, "listed"))
+            hd = parse_hit_dob(v)
+            if hd:
+                self.dobs.append(hd)
         if self.dobs:
             self.dob_source = "listed"
         if not self.dobs and not self.company:
@@ -859,10 +958,14 @@ class Hit:
             if self.dobs:
                 self.dob_source = "profile notes"
         self.search_used = []
+        self.alt_dobs, self.alt_used = [], []
         if not self.dobs and not self.company:
             self.dobs, self.search_used = self._dobs_from_search(data)
             if self.dobs:
                 self.dob_source = "search results"
+        elif self.dob_source == "profile notes":
+            # kept aside: if the hit's own sources disagree with each other, a person decides
+            self.alt_dobs, self.alt_used = self._dobs_from_search(data)
 
     def _dobs_from_text(self, text, src=None):
         out = []
@@ -875,16 +978,18 @@ class Hit:
             ds = dates_in_text(seg)
             if ds:
                 d = ds[0][2]
-                out.append(HitDob({d.y}, d.m, d.d, src, "born"))
+                approx = bool(_APPROX.search(seg[:ds[0][0]]))
+                out.append(HitDob({d.y}, d.m, d.d, src, "born", approx))
         # aged N ... at/in DATE ; N-year-old ; age N
         for m in AGE_RE.finditer(t):
             age = next(int(g) for g in m.groups() if g)
             if not (10 <= age <= 110):
                 continue
             # the date of that statement: nearest date in the same sentence
-            sent_start = max(t.rfind(".", 0, m.start()) + 1, 0)
-            sent_end = t.find(". ", m.end())
-            sent_end = len(t) if sent_end < 0 else sent_end + 1
+            stops = [x.end() for x in re.finditer(r"(?<!\b[A-Z])\.(?=\s|$)", t)]
+            sent_start = max([x for x in stops if x <= m.start()] or [0])
+            later = [x for x in stops if x > m.end()]
+            sent_end = later[0] if later else len(t)
             ds = [x for x in dates_in_text(t[sent_start:sent_end])]
             if not ds:
                 continue
@@ -933,6 +1038,8 @@ def dob_agree(cd, hd):
 
 
 def dob_contradicts(cd, hd):
+    if getattr(hd, "approx", False):
+        return False                      # 'circa 1980', '1980s': never a contradiction
     if all(abs(cd.y - y) > 1 for y in hd.years):
         return True
     if cd.y in hd.years and len(hd.years) == 1:
@@ -956,6 +1063,17 @@ class Decision:
 
 
 def decide(cust, hit, alert, screened_at):
+    hit.conflict_note = None
+    d = _decide(cust, hit, alert, screened_at)
+    if hit.conflict_note and d.decision == "REVIEW":
+        first = re.split(r"(?<=\.)\s+", d.reason)
+        keep = [x for x in first if "agrees with the hit's name" in x][:1]
+        d = Decision("REVIEW", d.code, " ".join(keep + [hit.conflict_note, "Neither date can be preferred, so a person decides."]),
+                     list(d.evidence) + list(hit.alt_used), d.rid)
+    return d
+
+
+def _decide(cust, hit, alert, screened_at):
     rid = cust.rids[0] if cust.rids else None
     cust_names, name_src = cust.names_for_agreement()
     hit_srcs = list(hit.search_used)
@@ -1008,6 +1126,12 @@ def decide(cust, hit, alert, screened_at):
                 if dob_agree(f.value, hd) and agree_pair is None:
                     agree_pair = (f, hd)
         dob_agrees = agree_pair is not None and len(cust.dobs) == 1
+        if all_contra and hit.alt_dobs and any(dob_agree(f.value, hd) for f in cust.dobs for hd in hit.alt_dobs):
+            all_contra = False           # the hit's sources disagree: never clear on that
+            hit_srcs = hit_srcs + list(hit.alt_used)
+            hit.conflict_note = ("The hit's profile notes give a date of birth of %s, but its search results (%s) give %s, which "
+                                 "agrees with the customer, so the hit's own sources conflict." % (
+                                     " or ".join(str(x) for x in hit.dobs), fmt_list(hit.alt_used), " or ".join(str(x) for x in hit.alt_dobs)))
         if all_contra:
             f = cust.dobs[0]
             where = {"listed": "listed date of birth is", "profile notes": "profile notes put its birth year at",
@@ -1023,7 +1147,8 @@ def decide(cust, hit, alert, screened_at):
     cust_parts_ok = any(len(name_parts(n, cust.company)) >= 2 for n in cust_names) or cust.company
     if cust.legal_name and not cust.company:
         lp = name_parts(cust.legal_name.value)
-        if len(lp) >= 2 and names_agree_any([cust.legal_name.value], hit.names) is None:
+        if len(lp) >= 2 and names_agree_any([cust.legal_name.value], hit.names) is None and \
+                not non_latin(cust.legal_name.value) and not all(non_latin(n) for n in hit.names):
             contradictions.append(("NAME_MISMATCH_VERIFIED",
                                    "The customer's verified name is %s (%s), which does not match the hit's name %s." % (
                                        cust.legal_name.value, fmt_list(cust.legal_name.src), hit.names[0]),
@@ -1133,12 +1258,28 @@ def run(folder, out_path):
         screened_at = parse_date(alert.get("screened_at"))
         persons, how = data.resolve(alert)
         custs = [Customer(data, p, alert) for p in persons] or [Customer(data, [], alert)]
+        strict = data.strict_persons() if persons else []
+        alt_custs = None
+        if strict and sorted(map(sorted, strict)) != sorted(map(sorted, persons)):
+            alt_custs = [Customer(data, p, alert) for p in strict]
         for hid in as_list(alert.get("hit_ids")):
             h = data.hits.get(hid)
             if h is None:
                 continue
             hit = Hit(data, h)
             ds = [decide(c, hit, alert, screened_at) for c in custs]
+            if alt_custs is not None:
+                alt = [decide(c, hit, alert, screened_at) for c in alt_custs]
+                if {x.decision for x in alt} != {x.decision for x in ds}:
+                    ev = set()
+                    for x in ds + alt:
+                        ev |= set(x.evidence)
+                    ds = [Decision("REVIEW", "INSUFFICIENT_DATA",
+                                   "The customer's records are tied to another record only through a placeholder phone number. "
+                                   "Treated as one person the hit would be %s; treated separately it would be %s. A placeholder "
+                                   "number is too weak to settle that, so a person decides." % (
+                                       "/".join(sorted({x.decision for x in ds})), "/".join(sorted({x.decision for x in alt}))),
+                                   ev, ds[0].rid)]
             if len(ds) == 1:
                 d = ds[0]
                 rid = d.rid

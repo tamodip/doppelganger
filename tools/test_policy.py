@@ -334,6 +334,76 @@ class Policy(unittest.TestCase):
         h = R.hit("Daniel Okoro", dobs=["1980"], countries=["Nigeria"]); R.alert([h], "Daniel Okoro", acc)
         self.assertEqual(R.run(), R.run())
 
+    # ------------------------------------------------- hardening (cross-check with a second solution)
+    def _name_room(self, verified, hit_name):
+        R = Room(); rid, acc, _ = person(R, name=hit_name, dob="1980-05-10")
+        R.kyc(rid, acc, verified, "1980-05-10", "Nigeria")
+        h = R.hit(hit_name, dobs=["1990"], countries=["Nigeria"]); R.alert([h], hit_name, acc)
+        return R.run()[h]
+
+    def test_special_letters_fold_before_comparing_names(self):
+        for v, hname in [("Işık Yılmaz", "Isik Yilmaz"), ("Johann Strauß", "Johann Strauss"),
+                         ("Þór Guðmundsson", "Thor Gudmundsson"), ("Łukasz Wałęsa", "Lukasz Walesa")]:
+            r = self._name_room(v, hname)
+            self.assertNotEqual(r["reason_code"], "NAME_MISMATCH_VERIFIED", v)
+
+    def test_lookalike_or_foreign_script_never_clears_on_name(self):
+        for v in ["Аnna Smith", "Иван Петров"]:          # Cyrillic A / full Cyrillic
+            r = self._name_room(v, "Anna Smith")
+            self.assertNotEqual(r["reason_code"], "NAME_MISMATCH_VERIFIED", v)
+
+    def test_circa_and_decade_hit_dobs_never_contradict(self):
+        for v in ["circa 1980", "c. 1980", "1980s"]:
+            R = Room(); rid, acc, _ = person(R, dob="1984-01-01")
+            h = R.hit("Daniel Okoro", dobs=[v], countries=["Nigeria"]); R.alert([h], "Daniel Okoro", acc)
+            self.assertNotEqual(R.run()[h]["decision"], "DIFFERENT_ENTITY", v)
+
+    def test_year_range_contradicts_when_every_year_is_far(self):
+        R = Room(); rid, acc, _ = person(R, dob="1984-01-01")
+        h = R.hit("Daniel Okoro", dobs=["1979-1981"], countries=["Nigeria"]); R.alert([h], "Daniel Okoro", acc)
+        self.check(R.run()[h], "DIFFERENT_ENTITY", "DOB_MISMATCH")
+
+    def test_bare_congo_never_clears_on_location(self):
+        R = Room(); rid, acc, _ = person(R, country="Democratic Republic of the Congo")
+        h = R.hit("Daniel Okoro", countries=["Congo"]); R.alert([h], "Daniel Okoro", acc)
+        self.assertNotEqual(R.run()[h]["decision"], "DIFFERENT_ENTITY")
+
+    def test_two_digit_year_in_note_is_unreadable(self):
+        R = Room(); rid, acc, email = person(R, dob="1960-01-01")
+        R.note(email, "Passport of DANIEL OKORO verified by Sumsub on 2024-06-01, DOB 12/04/85.")
+        h = R.hit("Daniel Okoro", dobs=["1985"], countries=["Nigeria"]); R.alert([h], "Daniel Okoro", acc)
+        self.assertNotEqual(R.run()[h]["decision"], "DIFFERENT_ENTITY")
+
+    def test_phone_security_check_is_not_an_identity_check(self):
+        R = Room(); rid, acc, email = person(R, dob="1980-05-10")
+        R.kyc(rid, acc, "DANIEL OKORO", "1980-05-10", "Nigeria", when="2022-01-01")
+        R.note(email, "Customer called about a card payment; identity verified on the phone by security questions.",
+               channel="phone", when="2025-02-02")
+        h = R.hit("Daniel Okoro", dobs=["1980-05-10"], countries=["Nigeria"]); R.alert([h], "Daniel Okoro", acc)
+        self.check(R.run()[h], "SAME_ENTITY")
+
+    def test_hit_sources_that_disagree_go_to_review(self):
+        R = Room(); rid, acc, _ = person(R, dob="1955-11-19", country="United States")
+        h = R.hit("Daniel Okoro", countries=["United States"], category="Enforcement", notes="Name: Okoro, Daniel\nDOB: 6/20/1955")
+        R.search("Daniel Okoro",
+                 "Throughout March 2011, United States news media featured Daniel Okoro, 55, who was the subject of enforcement action.")
+        R.alert([h], "Daniel Okoro", acc)
+        self.check(R.run()[h], "REVIEW")
+
+    def test_placeholder_phone_decides_both_ways(self):
+        R = Room()
+        rid1, acc1, _ = R.customer("Daniel Okoro", dob="1980-05-10", nationality="United Kingdom", residence="United Kingdom", phone="0000000000")
+        R.customer("Daniel Okoro", dob="1980-05-10", nationality="Kenya", residence="Kenya", phone="0000000000")
+        h = R.hit("Daniel Okoro", countries=["Kenya"]); R.alert([h], "Daniel Okoro", acc1)
+        self.check(R.run()[h], "REVIEW")
+
+    def test_linked_record_is_the_one_reported(self):
+        R = Room()
+        old, _, _ = R.customer("Daniel Okoro", dob="1980-05-10", nationality="Nigeria", residence="Nigeria", phone="+234 803 555 1234")
+        new, acc, _ = R.customer("Daniel Okoro", dob="1980-05-10", nationality="Nigeria", residence="Nigeria", phone="+234 803 555 1234")
+        h = R.hit("Daniel Okoro", dobs=["1980"], countries=["Nigeria"]); R.alert([h], "Daniel Okoro", acc)
+        self.assertEqual(R.run()[h]["customer_record_id"], new)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
