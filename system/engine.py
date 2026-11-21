@@ -772,12 +772,17 @@ def age_years(age, when):
     return {when.y - age, when.y - age - 1}
 
 
-_AGE_END = r"(?=\s*(?:years?(?:[- ]old|\s+of\s+age)?\b|yrs?\b|[.,;:)!?]|$|\s+(?:and|when|at|in|on|as|after|while|but|during|following|before|then)\b))"
+# an age: a 2-3 digit number after an age word, not followed by a unit that
+# would make it a count ("37 million", "46 days", "23 people", "15%")
+_NOT_AGE_UNIT = (r"(?!\s*(?:%|percent|per\s*cent|million|billion|thousand|bn|m\b|k\b|days?|weeks?|months?|hours?|minutes?|"
+                 r"people|persons?|men|women|children|counts?|charges?|times|cases?|percent|members?|victims?|units?|"
+                 r"companies|firms|accounts|properties|vehicles|kg|km|miles|dollars|usd|eur|gbp|naira|rupees|euros?|pounds?))")
 AGE_RE = re.compile(
-    r"(?:\b(?:aged?|age of|was|is|were|turned|turning|reached|reaching|being|at)\s+(?:about\s+|around\s+|approximately\s+|just\s+)?(\d{2,3})" + _AGE_END +
+    r"(?:\b(?:aged?|age\s+of|was|is|were|turned|turning|reached|reaching|being|at|then|now|who\s+was)\s+"
+    r"(?:about\s+|around\s+|approximately\s+|just\s+|only\s+)?(\d{2,3})\b" + _NOT_AGE_UNIT + r"(?![.,]\d)"
     r"|\b(\d{2,3})[- ]years?[- ]old\b"
     r"|\b(\d{2,3})\s+years\s+of\s+age\b"
-    r"|,\s*(\d{2,3})\s*,"
+    r"|,\s*(\d{2,3})\s*,(?!\d)"
     r"|\(\s*(?:aged?\s*)?(\d{2,3})\s*\))", re.I)
 
 
@@ -1033,9 +1038,10 @@ def decide(cust, hit, alert, screened_at):
     # ---- location
     cc = set(cust.countries)
     shared = cc & hit.countries
-    if cc and hit.countries and not shared and not hit.unreadable_country and not cust.unreadable_country:
+    country_conflict = bool(cc and hit.countries and not shared)
+    if country_conflict and not hit.unreadable_country and not cust.unreadable_country:
         if agreeing_name and dob_agrees:
-            pass  # a country difference does not clear a name+DOB agreement
+            pass  # a country difference does not clear a name+DOB agreement: REVIEW below
         else:
             contradictions.append(("LOCATION_MISMATCH",
                                    "The customer is linked only to %s but the hit is linked only to %s." % (fmt_list(cc), fmt_list(hit.countries)),
@@ -1059,6 +1065,14 @@ def decide(cust, hit, alert, screened_at):
             ev = set(name_src) | cust.country_srcs(shared)
             return Decision("SAME_ENTITY", "NAME_LOCATION_MATCH", loc_txt + name_txt, ev, rid)
     else:
+        if agreeing_name and dob_agrees and cust_parts_ok and country_conflict:
+            f, hd = agree_pair
+            txt = ("The customer's name agrees with the hit's name %s and their date of birth %s (%s) agrees with the hit's %s, "
+                   "but the customer is linked only to %s and the hit only to %s. A country difference cannot clear a name and "
+                   "date-of-birth agreement, and it prevents confirming it, so a person must decide." % (
+                       agreeing_name, f.value, fmt_list(f.src) or "screened", hd, fmt_list(cc), fmt_list(hit.countries)))
+            ev = set(name_src) | set(f.src) | cust.country_srcs(None) | set(hit_srcs)
+            return Decision("REVIEW", "INSUFFICIENT_DATA", txt, ev, rid)
         if agreeing_name and dob_agrees and cust_parts_ok:
             f, hd = agree_pair
             dtxt = "The customer's date of birth %s (%s) agrees with the hit's %s. " % (f.value, fmt_list(f.src) or "screened", hd)

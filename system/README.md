@@ -12,7 +12,7 @@ Python 3 standard library only. No language model, no network, no randomness.
 |---|---|
 | Practice labels (validate.py) | 50/50 right decisions, **0 unsafe clearances**, decision score 100 |
 | Reason code / customer record / evidence on practice hits | 100% / 100% / 50 of 50 exact |
-| Decisions on all 819 hits | 466 DIFFERENT_ENTITY, 134 SAME_ENTITY, 219 REVIEW (27% review rate) |
+| Decisions on all 819 hits | 465 DIFFERENT_ENTITY, 124 SAME_ENTITY, 230 REVIEW (28% review rate) |
 | Run time | about 8 seconds for the full development set (72k customers) |
 | Cost | $0 (no model calls) |
 | Reproducibility | 5 runs, byte-identical output |
@@ -68,7 +68,7 @@ Every fact carries the IDs of the records it came from (`Fact(value, src)`), for
 ## Safety design (an unsafe clearance costs 60, a review costs 2–3)
 - **DIFFERENT_ENTITY only on a named contradiction from the policy.** There is no "probably different".
 - **Verified beats declared, and a failed read never falls back to a guess.** If a verification note exists but its birth date can't be read, the customer's DOB is treated as unknown rather than trusting the self-declared date. (A self-declared DOB once caused an unsafe clearance during development; this rule removes the whole class.)
-- **Location never clears a name + DOB agreement** (policy 6). If any country value on either side can't be read, location never clears either.
+- **Location never clears a name + DOB agreement** (policy 6), and a country difference also prevents confirming it: the hit goes to REVIEW. If any country value on either side can't be read, location never clears.
 - **Several unverified customer DOBs:** we clear on DOB only if every one of them contradicts.
 - **Names with fewer than two real parts** (placeholders like N/A or 0000 removed) are neither confirmed nor cleared on name.
 
@@ -77,7 +77,7 @@ No model, no randomness, sorted iteration everywhere, sets sorted before output.
 
 ## Free text: built for unseen wording
 - **Verification notes:** the name is the longest run of CAPITALISED words (Unicode-aware, so ÉŁĆ work). The DOB is the date nearest a birth keyword (born, DOB, birth date …), else the one date at least 10 years before the note. A note counts as an approved check unless it explicitly says rejected, failed, expired or similar. In the development set this reads a name and a DOB from all 21,220 verification notes.
-- **Ages:** "aged 45", "he was 46", "reached the age of 38", "at the age of 33", "45-year-old", "Name, 51,", "(46)", each paired with the nearest date in the same sentence.
+- **Ages:** "aged 45", "he was 46", "reached the age of 23 upon…", "then 37", "at the age of 33", "45-year-old", "Name, 51,", "(46)", each paired with the nearest date in the same sentence. Numbers followed by a unit ("37 million", "46 days") are not ages.
 - **Dates:** ISO, day-first slashes (the data room never writes month-first; the engine reads month-first only when the second number is above 12), "10 Sep 1962", "September 10, 1962", "Sep 1962", year only.
 - We fixed every practice-label mismatch by generalising a rule, never by matching an ID or a specific sentence.
 
@@ -91,6 +91,9 @@ The hit has no `dobs`, but its profile notes say "when investigators questioned 
 
 **Left for review: H-FF3096 → REVIEW / INSUFFICIENT_DATA.**
 The customer's name agrees with "Abdul Rahman Yasin", and a support note (NOTE-10AEAB) says they lived in the United States, a country tied to the hit, so location can't clear it. The hit gives no date of birth anywhere (fields, notes or matching search results), so it can be neither cleared nor confirmed. A human decides.
+
+## Cross-checked against an independent implementation
+We compared all 819 decisions with a second, independently written rules engine. They disagreed on only 8 hits. We traced each one to the policy text and fixed the 2 where we were wrong (an age wording we missed, and a name + DOB agreement with a country difference, which the policy says is REVIEW). One disagreement was the other engine trusting a self-declared birth date over a verified note, which would have been an unsafe clearance.
 
 ## What we can't do (honest limits)
 - Free text worded very differently from anything above (for example a birth date given only as "born the year the Berlin Wall fell") won't be read. The engine then falls back to REVIEW, never to a clearance.
